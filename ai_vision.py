@@ -176,6 +176,14 @@ def extract_text_with_ai_vision(
 10. Preserve the spatial layout using appropriate spacing and line breaks.
 11. Identify multiple columns or sections and preserve their order and structure.
 12. Do not add commentary, interpretation, corrections, or explanations to the transcription.
+13. Do not repeat any word, line, paragraph, section, or marginal note.
+14. Transcribe each visible line only once.
+15. If the same text appears twice in the image, transcribe it twice only if it
+    is visibly present twice.
+16. Do not continue a previous line or paragraph unless that continuation is
+    visible in the image.
+17. If you lose your place, stop and mark the uncertain location with [?]
+    rather than restarting or repeating text.
 
 Return ONLY the transcribed text with no additional commentary."""
 
