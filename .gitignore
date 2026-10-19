@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+
+# Generated results
+ocr_results_ai_vision/
+transcriptions/
+outputs/
+
+# Local/private documents
+input/
+documents/
+images/
+
+# macOS
+.DS_Store
