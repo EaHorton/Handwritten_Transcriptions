@@ -164,16 +164,18 @@ def extract_text_with_ai_vision(
         # Prepare the prompt for accurate transcription
         prompt = """Extract ALL text from this image exactly as it appears. Follow these strict guidelines:
 
-1. Transcribe every piece of visible text, preserving the original layout and structure
-2. Maintain line breaks, paragraph breaks, and spatial relationships
-3. Do not add any commentary, interpretation, or explanations
-4. If text is unclear or partially obscured, transcribe what you can see - use [?] only for completely illegible characters
-5. Preserve original spelling, punctuation, and formatting exactly as written
-6. Include headers, titles, dates, numbers, and all visible text elements
-7. If text is in a non-Latin script (Arabic, Chinese, Tamil, etc.), transcribe it exactly as written
-8. Do not translate anything - only transcribe in the original language
-9. Preserve the spatial layout - use appropriate spacing and line breaks to match the original
-10. If there are multiple columns or sections, maintain their structure
+1. Transcribe every piece of visible text, preserving the original layout and structure.
+2. Preserve line breaks, paragraph breaks, and spatial relationships exactly as shown.
+3. Preserve spelling exactly, including unusual, historical, or incorrect spelling.
+4. Avoid silently expanding abbreviations; transcribe abbreviations exactly as written.
+5. If a character or word is uncertain but partially visible, transcribe the visible text and mark the uncertain character with [?].
+6. Distinguish uncertainty from illegibility: use [?] for a visible but uncertain character, and use [illegible] only when the character or text cannot be read at all.
+7. Avoid adding words that are not visible in the image, even when they seem likely from context.
+8. Preserve marginal notes, headings, titles, dates, numbers, and all other visible text.
+9. If text is in a non-Latin script (Arabic, Chinese, Tamil, etc.), transcribe it exactly as written without translation.
+10. Preserve the spatial layout using appropriate spacing and line breaks.
+11. Identify multiple columns or sections and preserve their order and structure.
+12. Do not add commentary, interpretation, corrections, or explanations to the transcription.
 
 Return ONLY the transcribed text with no additional commentary."""
 
