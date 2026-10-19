@@ -281,6 +281,7 @@ For an image named `page-001.jpg`, the script creates:
 
 ```text
 page-001_transcription.txt
+page-001_verification.txt
 ```
 
 Each transcription includes:
@@ -289,6 +290,13 @@ Each transcription includes:
 - The processing date.
 - Quality-review information.
 - The model’s transcribed text.
+
+The verification file is produced by a second vision-model request. It
+compares the original image with the first transcription and reports possible
+missing words, added words, spelling errors, incorrect names or numbers,
+omitted marginal notes, and layout or reading-order problems. It does not
+silently rewrite the transcription. The original image remains authoritative,
+so a person should review every flagged item.
 
 The output directory also contains:
 
@@ -304,6 +312,9 @@ are listed in `ai_vision.py`.
 
 If the program reports a quality concern, it preserves the transcription and
 marks the file for review. It does not silently delete uncertain text.
+
+The verification pass approximately doubles the number of vision requests and
+may increase processing time and cost.
 
 ## Useful options
 
@@ -335,6 +346,27 @@ python ai_vision.py \
 ```
 
 Larger images may preserve more detail but can increase processing cost.
+
+### Choose a verification model
+
+By default, the verification pass uses the same model as the first
+transcription pass. This is the recommended starting point because it keeps
+the workflow simple and makes results easier to compare.
+
+You can choose a different model when you want a second model to provide an
+independent perspective:
+
+```bash
+python ai_vision.py \
+  --input-dir PATH_TO_IMAGES \
+  --output-dir PATH_TO_OUTPUT \
+  --verification-model gpt-4o
+```
+
+Using a different model does not guarantee a better result. It can expose
+disagreements, but it also adds model differences that a person must resolve.
+For legal or historical documents, treat disagreements as review flags rather
+than automatically choosing one model's answer.
 
 ### See all available options
 

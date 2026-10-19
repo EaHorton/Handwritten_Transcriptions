@@ -239,6 +239,83 @@ Return ONLY the transcribed text with no additional commentary."""
             "text_length": 0
         }
 
+def verify_transcription_with_ai_vision(
+    image_path: str,
+    transcribed_text: str,
+    client: OpenAI,
+    tracker: TokenTracker,
+    model: str,
+    max_image_size: Tuple[int, int] = (2048, 2048),
+) -> str:
+    """Compare a draft transcription with its source image and report concerns."""
+    optimized_path: Optional[str] = None
+    try:
+        optimized_path = optimize_image_for_api(image_path, max_image_size)
+        base64_image = encode_image_to_base64(optimized_path)
+        prompt = f"""Review the image against the draft transcription below.
+Identify possible transcription errors, omissions, additions, or ordering
+problems. Pay special attention to names, dates, numbers, abbreviations,
+marginal notes, headings, and multiple columns or sections.
+
+Do not rewrite or silently correct the draft. Report only evidence-based
+concerns and quote the relevant draft text when possible. If you find no
+obvious discrepancy, say so while noting that human review is still required.
+
+Draft transcription:
+--- BEGIN DRAFT ---
+{transcribed_text}
+--- END DRAFT ---
+
+Return a concise verification report with:
+1. Verification status: NO OBVIOUS DISCREPANCIES or REVIEW REQUIRED
+2. Numbered potential issues, if any
+3. A reminder that the original image remains authoritative."""
+
+        mime_type = mimetypes.guess_type(optimized_path)[0] or "image/jpeg"
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{base64_image}",
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=3000,
+            temperature=0,
+        )
+
+        usage = response.usage
+        if usage is not None:
+            tracker.add_usage(
+                model,
+                usage.prompt_tokens or 0,
+                usage.completion_tokens or 0,
+            )
+
+        content: Optional[str] = response.choices[0].message.content
+        if not content:
+            raise ValueError("The verification model returned an empty report.")
+        return content.strip()
+    except Exception as exc:
+        print(f"Error verifying {image_path}: {exc}")
+        return f"[ERROR: Could not verify transcription - {exc}]"
+    finally:
+        if (
+            optimized_path
+            and optimized_path != image_path
+            and os.path.exists(optimized_path)
+        ):
+            os.remove(optimized_path)
+
 def save_transcription(
     image_path: str,
     transcribed_text: str,
@@ -287,6 +364,27 @@ def save_transcription(
         
     except Exception as e:
         print(f"Error saving transcription: {e}")
+        return None
+
+def save_verification_report(
+    image_path: str,
+    verification_report: str,
+    output_dir: str,
+) -> Optional[str]:
+    """Save the independent verification report beside its transcription."""
+    try:
+        output_file = os.path.join(
+            output_dir,
+            f"{Path(image_path).stem}_verification.txt",
+        )
+        with open(output_file, "w", encoding="utf-8") as file:
+            file.write(f"Source Image: {Path(image_path).name}\n")
+            file.write(f"Verification Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            file.write("=" * 60 + "\n\n")
+            file.write(verification_report)
+        return output_file
+    except OSError as exc:
+        print(f"Error saving verification report: {exc}")
         return None
 
 def save_usage_summary(tracker: TokenTracker, output_dir: str, image_files: List[str]) -> None:
@@ -369,6 +467,11 @@ def parse_args() -> argparse.Namespace:
         help="OpenAI vision model (default: OPENAI_MODEL or gpt-4o)",
     )
     parser.add_argument(
+        "--verification-model",
+        default=os.getenv("OPENAI_VERIFICATION_MODEL"),
+        help="Model for the verification pass (default: same as --model)",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("ocr_results_ai_vision"),
@@ -413,6 +516,7 @@ def main() -> int:
     # Initialize OpenAI client
     client = OpenAI(api_key=api_key)
     tracker = TokenTracker()
+    verification_model = args.verification_model or args.model
     
     # Define paths
     base_dir = Path(__file__).parent
@@ -494,8 +598,20 @@ def main() -> int:
                 model=args.model,
                 max_image_size=(args.max_image_size, args.max_image_size),
             )
+
+            verification_report: Optional[str] = None
+            if not transcribed_text.startswith("[ERROR:"):
+                print("    Running verification pass...")
+                verification_report = verify_transcription_with_ai_vision(
+                    str(img_file),
+                    transcribed_text,
+                    client,
+                    tracker,
+                    model=verification_model,
+                    max_image_size=(args.max_image_size, args.max_image_size),
+                )
             
-            # If hallucinations detected, clean the text
+            # Preserve flagged text and leave the review decision to a person.
             if analysis_results['needs_review']:
                 print("  ⚠️ Quality issues detected:")
                 for reason in analysis_results['review_reasons']:
@@ -517,9 +633,18 @@ def main() -> int:
                 str(image_output_dir),
                 analysis_results,
             )
+            verification_file = None
+            if verification_report is not None:
+                verification_file = save_verification_report(
+                    str(img_file),
+                    verification_report,
+                    str(image_output_dir),
+                )
             
             if output_file:
                 print(f"    Saved to: {Path(output_file).name}")
+                if verification_file:
+                    print(f"    Verification saved to: {Path(verification_file).name}")
                 print(f"    Text length: {len(transcribed_text)} characters")
             else:
                 print("    Error: Could not save transcription")
@@ -535,6 +660,8 @@ def main() -> int:
                     'image': img_file.name,
                     'text': transcribed_text,
                     'output_file': str(output_file),
+                    'verification_file': str(verification_file) if verification_file else None,
+                    'verification_report': verification_report,
                     'analysis': analysis_results
                 })
             
