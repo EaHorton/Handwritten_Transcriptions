@@ -13,11 +13,16 @@ import time
 import argparse
 import mimetypes
 import sys
+import tempfile
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image
 from openai import OpenAI
 from hallucination_detector import HallucinationDetector
+
+MAX_TRANSCRIPTION_CHARS = 20000
+REGION_MAX_HEIGHT = 1800
 
 # OpenAI API pricing (as of 2024 - verify current rates)
 PRICING = {
@@ -206,7 +211,7 @@ Return ONLY the transcribed text with no additional commentary."""
                     ]
                 }
             ],
-            max_tokens=4000,
+            max_tokens=3000,
             temperature=0  # Use 0 for consistent, deterministic transcription
         )
         
@@ -224,6 +229,10 @@ Return ONLY the transcribed text with no additional commentary."""
         if not content:
             raise ValueError("The vision model returned an empty transcription.")
         transcribed_text = content.strip()
+        if len(transcribed_text) > MAX_TRANSCRIPTION_CHARS:
+            raise ValueError(
+                f"The transcription exceeded the {MAX_TRANSCRIPTION_CHARS:,}-character safeguard."
+            )
         
         # Analyze for hallucinations
         analysis_results = detector.analyze_text(transcribed_text, image_path)
@@ -247,6 +256,66 @@ Return ONLY the transcribed text with no additional commentary."""
             "text_length": 0
         }
 
+def transcribe_image(
+    image_path: str,
+    client: OpenAI,
+    tracker: TokenTracker,
+    detector: HallucinationDetector,
+    model: str,
+    max_image_size: Tuple[int, int],
+) -> Tuple[str, Dict[str, Any]]:
+    """Transcribe a page once or in horizontal regions when it is dense."""
+    with Image.open(image_path) as image:
+        width, height = image.size
+        region_count = max(1, math.ceil(height / REGION_MAX_HEIGHT))
+        if region_count == 1:
+            return extract_text_with_ai_vision(
+                image_path, client, tracker, detector, model, max_image_size
+            )
+
+        texts: List[str] = []
+        region_reasons: List[str] = []
+        for region_index in range(region_count):
+            top = round(region_index * height / region_count)
+            bottom = round((region_index + 1) * height / region_count)
+            with tempfile.NamedTemporaryFile(
+                suffix=Path(image_path).suffix, delete=False
+            ) as region_file:
+                region_path = region_file.name
+            try:
+                image.crop((0, top, width, bottom)).save(region_path)
+                region_text, region_analysis = extract_text_with_ai_vision(
+                    region_path,
+                    client,
+                    tracker,
+                    detector,
+                    model,
+                    max_image_size,
+                )
+                texts.append(
+                    f"[REGION {region_index + 1} OF {region_count}]\n{region_text}"
+                )
+                region_reasons.extend(region_analysis.get("review_reasons", []))
+            finally:
+                if os.path.exists(region_path):
+                    os.remove(region_path)
+
+        combined_text = "\n\n".join(texts)
+        repetition_findings = detector.detect_repetition(combined_text)
+        reasons = [
+            f"Page was transcribed in {region_count} horizontal regions.",
+            *region_reasons,
+            *repetition_findings,
+        ]
+        return combined_text, {
+            "needs_review": True,
+            "review_reasons": list(dict.fromkeys(reasons)),
+            "repetition_findings": repetition_findings,
+            "quality_metrics": {"dpi": 0.0},
+            "text_length": len(combined_text),
+            "regions": region_count,
+        }
+
 def verify_transcription_with_ai_vision(
     image_path: str,
     transcribed_text: str,
@@ -261,13 +330,14 @@ def verify_transcription_with_ai_vision(
         optimized_path = optimize_image_for_api(image_path, max_image_size)
         base64_image = encode_image_to_base64(optimized_path)
         prompt = f"""Review the image against the draft transcription below.
-Identify possible transcription errors, omissions, additions, or ordering
-problems. Pay special attention to names, dates, numbers, abbreviations,
-marginal notes, headings, and multiple columns or sections.
+Flag possible omissions, additions, repeated passages, or ordering problems.
+Pay special attention to names, dates, numbers, abbreviations, marginal notes,
+headings, and multiple columns or sections.
 
-Do not rewrite or silently correct the draft. Report only evidence-based
-concerns and quote the relevant draft text when possible. If you find no
-obvious discrepancy, say so while noting that human review is still required.
+Do not rewrite, correct, modernize, or silently change the draft. Do not say
+what the historical text "should" say. Report only a possible reading or
+evidence-based concern, quote the relevant draft text when possible, and state
+that human review is required. If you find no obvious discrepancy, say so.
 
 Draft transcription:
 --- BEGIN DRAFT ---
@@ -345,7 +415,9 @@ def save_transcription(
     try:
         image_name = Path(image_path).name
         base_name = Path(image_path).stem
-        output_file = os.path.join(output_dir, f"{base_name}_transcription.txt")
+        output_file = os.path.join(
+            output_dir, f"{base_name}_raw_transcription.txt"
+        )
         
         # Save transcription with metadata
         with open(output_file, 'w', encoding='utf-8') as f:
@@ -598,7 +670,7 @@ def main() -> int:
             print(f"  [{i}/{len(image_files)}] Processing: {img_file.name}")
             
             # Extract text using AI vision with hallucination detection
-            transcribed_text, analysis_results = extract_text_with_ai_vision(
+            transcribed_text, analysis_results = transcribe_image(
                 str(img_file),
                 client,
                 tracker,
