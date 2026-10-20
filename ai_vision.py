@@ -18,11 +18,12 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 from hallucination_detector import HallucinationDetector
 
 MAX_TRANSCRIPTION_CHARS = 20000
 REGION_MAX_HEIGHT = 1800
+LAYOUT_CLASSIFICATION_MAX_TOKENS = 120
 
 # OpenAI API pricing (as of 2024 - verify current rates)
 PRICING = {
@@ -112,7 +113,8 @@ def optimize_image_for_api(image_path: str, max_size: Tuple[int, int] = (2048, 2
             # Check if image needs resizing
             if img.size[0] <= max_size[0] and img.size[1] <= max_size[1]:
                 return image_path
-            
+
+
             # Calculate new size maintaining aspect ratio
             ratio = min(max_size[0] / img.size[0], max_size[1] / img.size[1])
             new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
@@ -138,6 +140,107 @@ def optimize_image_for_api(image_path: str, max_size: Tuple[int, int] = (2048, 2
         print(f"Warning: Could not optimize image {image_path}: {e}")
         return image_path
 
+
+def classify_document_layout(
+    image_path: str,
+    client: OpenAI,
+    tracker: TokenTracker,
+    model: str,
+    max_image_size: Tuple[int, int],
+) -> Dict[str, Any]:
+    """Classify whether a page contains a table before choosing a transcription prompt."""
+    optimized_path: Optional[str] = None
+    try:
+        optimized_path = optimize_image_for_api(image_path, max_image_size)
+        base64_image = encode_image_to_base64(optimized_path)
+        mime_type = mimetypes.guess_type(optimized_path)[0] or "image/jpeg"
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Classify the visible document layout. Return ONLY a JSON object:
+{"layout_type": "paragraph" or "table" or "mixed", "confidence": 0.0 to 1.0, "reason": "brief visual evidence"}
+
+Use "table" only when most of the page is a visibly bounded grid, ledger, or
+repeated row-and-column structure. Use "mixed" when a bounded table occupies
+only part of the page and prose, headings, or certificates occupy another part.
+Use "paragraph" for prose, vertical lists, or multiple text columns that do not
+form repeated rows with stable column positions. Do not call aligned text a table
+merely because it has several columns. Base the decision on visible layout
+boundaries and repeated rows, not document subject matter.""",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{base64_image}",
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_tokens=LAYOUT_CLASSIFICATION_MAX_TOKENS,
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        usage = response.usage
+        if usage is not None:
+            tracker.add_usage(
+                model,
+                usage.prompt_tokens or 0,
+                usage.completion_tokens or 0,
+            )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("The layout classifier returned an empty response.")
+        result = json.loads(content)
+        if not isinstance(result, dict):
+            raise ValueError("The layout classifier returned an invalid JSON object.")
+        layout_type = result.get("layout_type")
+        if layout_type not in {"paragraph", "table", "mixed"}:
+            # Accept the previous classifier shape if a model or cached response
+            # still returns it, while defaulting conservatively.
+            layout_type = "table" if result.get("has_table") is True else "paragraph"
+        result["layout_type"] = layout_type
+        result["has_table"] = layout_type in {"table", "mixed"}
+        result["confidence"] = float(result.get("confidence", 0.0))
+        result["reason"] = str(result.get("reason", "")).strip()
+        return result
+    except (OpenAIError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+        print(f"Warning: Could not classify layout for {image_path}: {exc}")
+        return {
+            "has_table": False,
+            "layout_type": "paragraph",
+            "confidence": 0.0,
+            "reason": "Layout classification failed; used the standard transcription path.",
+            "classification_error": str(exc),
+        }
+    finally:
+        if (
+            optimized_path
+            and optimized_path != image_path
+            and os.path.exists(optimized_path)
+        ):
+            os.remove(optimized_path)
+
+
+def remove_synthetic_table_placeholders(text: str) -> Tuple[str, bool]:
+    """Remove the placeholder token from table output under the table contract."""
+    if "[blank]" not in text:
+        return text, False
+
+    cleaned_lines: List[str] = []
+    for line in text.splitlines():
+        cleaned = line.replace("[blank]", "").rstrip()
+        if cleaned.strip("\t ").strip():
+            cleaned_lines.append(cleaned)
+    return "\n".join(cleaned_lines), True
+
+
 def extract_text_with_ai_vision(
     image_path: str,
     client: OpenAI,
@@ -145,6 +248,8 @@ def extract_text_with_ai_vision(
     detector: HallucinationDetector,
     model: str = "gpt-4o",
     max_image_size: Tuple[int, int] = (2048, 2048),
+    table_mode: bool = False,
+    layout_mode: str = "paragraph",
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Extract text from image using OpenAI's Vision API with hallucination detection.
@@ -166,8 +271,34 @@ def extract_text_with_ai_vision(
         # Encode image to base64
         base64_image = encode_image_to_base64(optimized_path)
         
-        # Prepare the prompt for accurate transcription
-        prompt = """Extract ALL text from this image exactly as it appears. Follow these strict guidelines:
+        # Tables need a row/column representation; a paragraph prompt encourages
+        # vision models to flatten aligned values and then repeat them.
+        if layout_mode in {"table", "mixed"} or table_mode:
+            prompt = f"""Transcribe this handwritten document with layout mode: {layout_mode}.
+{"A bounded table occupies most of the page." if layout_mode == "table" else "The page contains a bounded table plus non-table text."}
+
+Rules:
+1. Read from top to bottom. Within a real table, read each visible row from left to right.
+2. Within a real table, use TAB characters only between cells that visibly belong to
+   that row. Do not create a rectangular grid.
+3. Preserve every visible cell exactly, including spelling, abbreviations, punctuation,
+   names, and numbers.
+4. Never output "[blank]" or any placeholder for empty space. If a cell is empty, leave
+   that position empty between tabs only when the surrounding row and column boundaries
+   are visibly established. Otherwise omit the empty cell.
+5. Do not add a row merely because a column continues. Stop at the last visible row.
+6. In non-table areas, use ordinary line breaks and prose layout; do not add tabs or
+   placeholders to make prose fit table columns.
+7. Never invent a value to fill a blank or align a damaged row.
+8. Transcribe a row only once. Never repeat a row, cell, or sequence to fill output.
+9. If a value is visibly uncertain, mark only the uncertain character with [?]; use
+   [illegible] only when no character can be read.
+10. Stop after the last visible text. Do not continue a pattern or restart at a new column.
+
+Return ONLY the transcription. Do not include Markdown table syntax, commentary, or a
+summary."""
+        else:
+            prompt = """Extract ALL text from this image exactly as it appears. Follow these strict guidelines:
 
 1. Transcribe every piece of visible text, preserving the original layout and structure.
 2. Preserve line breaks, paragraph breaks, and spatial relationships exactly as shown.
@@ -229,6 +360,11 @@ Return ONLY the transcribed text with no additional commentary."""
         if not content:
             raise ValueError("The vision model returned an empty transcription.")
         transcribed_text = content.strip()
+        placeholder_removed = False
+        if layout_mode in {"table", "mixed"} or table_mode:
+            transcribed_text, placeholder_removed = remove_synthetic_table_placeholders(
+                transcribed_text
+            )
         if len(transcribed_text) > MAX_TRANSCRIPTION_CHARS:
             raise ValueError(
                 f"The transcription exceeded the {MAX_TRANSCRIPTION_CHARS:,}-character safeguard."
@@ -236,6 +372,16 @@ Return ONLY the transcribed text with no additional commentary."""
         
         # Analyze for hallucinations
         analysis_results = detector.analyze_text(transcribed_text, image_path)
+        if placeholder_removed:
+            analysis_results["needs_review"] = True
+            analysis_results["review_reasons"] = list(
+                dict.fromkeys(
+                    [
+                        "Removed synthetic [blank] placeholders from table-mode output; verify empty cells against the image.",
+                        *analysis_results.get("review_reasons", []),
+                    ]
+                )
+            )
         
         # Clean up optimized image if it was created
         if optimized_path != image_path and os.path.exists(optimized_path):
@@ -265,13 +411,46 @@ def transcribe_image(
     max_image_size: Tuple[int, int],
 ) -> Tuple[str, Dict[str, Any]]:
     """Transcribe a page once or in horizontal regions when it is dense."""
+    layout = classify_document_layout(
+        image_path, client, tracker, model, max_image_size
+    )
+    table_mode = bool(layout.get("has_table"))
     with Image.open(image_path) as image:
         width, height = image.size
         region_count = max(1, math.ceil(height / REGION_MAX_HEIGHT))
         if region_count == 1:
-            return extract_text_with_ai_vision(
-                image_path, client, tracker, detector, model, max_image_size
+            text, analysis = extract_text_with_ai_vision(
+                image_path,
+                client,
+                tracker,
+                detector,
+                model,
+                max_image_size,
+                table_mode,
+                layout.get("layout_type", "paragraph"),
             )
+            analysis["layout"] = layout
+            if table_mode:
+                analysis["needs_review"] = True
+                analysis["review_reasons"] = list(
+                    dict.fromkeys(
+                        [
+                            "Layout classifier identified a table or mixed layout; verify row and column alignment.",
+                            *analysis.get("review_reasons", []),
+                        ]
+                    )
+                )
+            elif layout.get("classification_error"):
+                analysis["needs_review"] = True
+                analysis["review_reasons"] = list(
+                    dict.fromkeys(
+                        [
+                            str(layout["reason"]),
+                            *analysis.get("review_reasons", []),
+                        ]
+                    )
+                )
+            return text, analysis
 
         texts: List[str] = []
         region_reasons: List[str] = []
@@ -291,6 +470,8 @@ def transcribe_image(
                     detector,
                     model,
                     max_image_size,
+                    table_mode,
+                    layout.get("layout_type", "paragraph"),
                 )
                 texts.append(
                     f"[REGION {region_index + 1} OF {region_count}]\n{region_text}"
@@ -307,6 +488,11 @@ def transcribe_image(
             *region_reasons,
             *repetition_findings,
         ]
+        if table_mode:
+            reasons.insert(
+                0,
+                "Layout classifier identified a table or mixed layout; review region joins and row alignment.",
+            )
         return combined_text, {
             "needs_review": True,
             "review_reasons": list(dict.fromkeys(reasons)),
@@ -314,8 +500,8 @@ def transcribe_image(
             "quality_metrics": {"dpi": 0.0},
             "text_length": len(combined_text),
             "regions": region_count,
+            "layout": layout,
         }
-
 def verify_transcription_with_ai_vision(
     image_path: str,
     transcribed_text: str,
@@ -431,6 +617,19 @@ def save_transcription(
                 dpi = analysis_results.get("quality_metrics", {}).get("dpi")
                 if dpi is not None:
                     f.write(f"Image DPI: {dpi:.1f}\n")
+                layout = analysis_results.get("layout")
+                if isinstance(layout, dict):
+                    layout_type = layout.get(
+                        "layout_type",
+                        "table" if layout.get("has_table") else "paragraph",
+                    )
+                    confidence = float(layout.get("confidence", 0.0))
+                    f.write(
+                        f"Detected layout: {layout_type} "
+                        f"(confidence {confidence:.2f})\n"
+                    )
+                    if layout.get("reason"):
+                        f.write(f"Layout evidence: {layout['reason']}\n")
                 if analysis_results['needs_review']:
                     f.write("Review Flags:\n")
                     for reason in analysis_results['review_reasons']:
@@ -690,7 +889,7 @@ def main() -> int:
                     model=verification_model,
                     max_image_size=(args.max_image_size, args.max_image_size),
                 )
-            
+
             # Preserve flagged text and leave the review decision to a person.
             if analysis_results['needs_review']:
                 print("  ⚠️ Quality issues detected:")
