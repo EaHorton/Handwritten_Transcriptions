@@ -23,7 +23,8 @@ from hallucination_detector import HallucinationDetector
 
 MAX_TRANSCRIPTION_CHARS = 20000
 REGION_MAX_HEIGHT = 1800
-LAYOUT_CLASSIFICATION_MAX_TOKENS = 120
+LAYOUT_CLASSIFICATION_MAX_TOKENS = 300
+REGION_OVERLAP = 24
 
 # OpenAI API pricing (as of 2024 - verify current rates)
 PRICING = {
@@ -148,7 +149,7 @@ def classify_document_layout(
     model: str,
     max_image_size: Tuple[int, int],
 ) -> Dict[str, Any]:
-    """Classify whether a page contains a table before choosing a transcription prompt."""
+    """Classify the page layout before choosing a transcription prompt."""
     optimized_path: Optional[str] = None
     try:
         optimized_path = optimize_image_for_api(image_path, max_image_size)
@@ -162,16 +163,27 @@ def classify_document_layout(
                     "content": [
                         {
                             "type": "text",
-                            "text": """Classify the visible document layout. Return ONLY a JSON object:
-{"layout_type": "paragraph" or "table" or "mixed", "confidence": 0.0 to 1.0, "reason": "brief visual evidence"}
+                            "text": """Classify the visible document layout and, when a map is present, locate its regions. Return ONLY a JSON object:
+{"layout_type": "paragraph", "table", "mixed", "map", or "mixed_map", "confidence": 0.0 to 1.0, "reason": "brief visual evidence", "regions": [{"type": "map" or "prose", "x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0}]}
+
+Region coordinates must be normalized to 0.0-1.0 relative to the complete
+image. For mixed_map, return non-overlapping regions that cover each visible
+map and each nearby prose area. Include the map's complete drawing, labels,
+and boundary context in its map region. Include marginal notes or headings
+as prose regions when they are separate from the map. Sort regions by their
+physical page position (top coordinate, then left coordinate). Do not return
+regions for blank space. If a map is not present, return an empty regions list.
 
 Use "table" only when most of the page is a visibly bounded grid, ledger, or
 repeated row-and-column structure. Use "mixed" when a bounded table occupies
 only part of the page and prose, headings, or certificates occupy another part.
+Use "map" when the page is primarily a hand-drawn map, parcel diagram, route
+diagram, or other spatial drawing with labels. Use "mixed_map" when a map or
+diagram occupies only part of the page and prose occupies another part.
 Use "paragraph" for prose, vertical lists, or multiple text columns that do not
 form repeated rows with stable column positions. Do not call aligned text a table
 merely because it has several columns. Base the decision on visible layout
-boundaries and repeated rows, not document subject matter.""",
+boundaries, spatial relationships, and repeated rows, not document subject matter.""",
                         },
                         {
                             "type": "image_url",
@@ -201,23 +213,32 @@ boundaries and repeated rows, not document subject matter.""",
         if not isinstance(result, dict):
             raise ValueError("The layout classifier returned an invalid JSON object.")
         layout_type = result.get("layout_type")
-        if layout_type not in {"paragraph", "table", "mixed"}:
+        if layout_type not in {"paragraph", "table", "mixed", "map", "mixed_map"}:
             # Accept the previous classifier shape if a model or cached response
             # still returns it, while defaulting conservatively.
-            layout_type = "table" if result.get("has_table") is True else "paragraph"
+            if result.get("has_map") is True:
+                layout_type = "map"
+            elif result.get("has_table") is True:
+                layout_type = "table"
+            else:
+                layout_type = "paragraph"
         result["layout_type"] = layout_type
         result["has_table"] = layout_type in {"table", "mixed"}
+        result["has_map"] = layout_type in {"map", "mixed_map"}
         result["confidence"] = float(result.get("confidence", 0.0))
         result["reason"] = str(result.get("reason", "")).strip()
+        result["regions"] = _validated_layout_regions(result.get("regions"))
         return result
     except (OpenAIError, json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
         print(f"Warning: Could not classify layout for {image_path}: {exc}")
         return {
             "has_table": False,
+            "has_map": False,
             "layout_type": "paragraph",
             "confidence": 0.0,
             "reason": "Layout classification failed; used the standard transcription path.",
             "classification_error": str(exc),
+            "regions": [],
         }
     finally:
         if (
@@ -226,6 +247,47 @@ boundaries and repeated rows, not document subject matter.""",
             and os.path.exists(optimized_path)
         ):
             os.remove(optimized_path)
+
+
+def _validated_layout_regions(raw_regions: Any) -> List[Dict[str, Any]]:
+    """Validate normalized layout regions returned by the vision model."""
+    if not isinstance(raw_regions, list):
+        return []
+
+    regions: List[Dict[str, Any]] = []
+    for raw_region in raw_regions:
+        if not isinstance(raw_region, dict):
+            continue
+        region_type = raw_region.get("type")
+        if region_type not in {"map", "prose"}:
+            continue
+        try:
+            x = float(raw_region["x"])
+            y = float(raw_region["y"])
+            width = float(raw_region["width"])
+            height = float(raw_region["height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            not all(math.isfinite(value) for value in (x, y, width, height))
+            or width <= 0
+            or height <= 0
+            or x < 0
+            or y < 0
+            or x + width > 1
+            or y + height > 1
+        ):
+            continue
+        regions.append(
+            {
+                "type": region_type,
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+            }
+        )
+    return sorted(regions, key=lambda region: (region["y"], region["x"]))
 
 
 def remove_synthetic_table_placeholders(text: str) -> Tuple[str, bool]:
@@ -271,9 +333,47 @@ def extract_text_with_ai_vision(
         # Encode image to base64
         base64_image = encode_image_to_base64(optimized_path)
         
-        # Tables need a row/column representation; a paragraph prompt encourages
+        # Maps need a structured visual description; a paragraph prompt encourages
+        # vision models to omit labels and relationships. Tables need a row/column
+        # representation; a paragraph prompt encourages
         # vision models to flatten aligned values and then repeat them.
-        if layout_mode in {"table", "mixed"} or table_mode:
+        if layout_mode in {"map", "mixed_map"}:
+            prompt = f"""Transcribe this handwritten document with layout mode: {layout_mode}.
+{"The page is primarily a hand-drawn map or spatial diagram." if layout_mode == "map" else "The page contains a hand-drawn map or spatial diagram plus non-map text."}
+
+Use this map-specific workflow:
+1. Read the page in physical reading order from top to bottom. When content is
+   side by side, read from left to right. Keep the transcription order faithful
+   to where content appears on the page.
+2. Insert a clearly marked section exactly as "[HAND-DRAWN MAP]" at the map's
+   position in that reading order, and end it with
+   "[END HAND-DRAWN MAP]".
+   For example, if the map is above a paragraph, the map section must come
+   before that paragraph in the transcription. Do not move the map description
+   to the end merely because it is a description.
+3. Transcribe prose, headings, dates, and marginal notes where they occur
+   relative to the map; do not summarize or reorder them.
+4. Within the map section, record all readable map labels, parcel or tract names,
+   adjoining owners, roads, waterways, buildings, measurements, bearings,
+   acreage, orientation marks, arrows, corrections, and parcel numbers.
+5. Describe the map's visible layout and relationships in concise text. State
+   where features are located relative to one another (for example, north,
+   south, left, right, adjoining, or central) without treating the drawing as
+   geographically accurate or to scale.
+6. Preserve the original spelling, abbreviations, punctuation, and numbers.
+7. Distinguish visible text from interpretation. Use "[illegible]" when no
+   characters can be read, "[?]" only for a visibly uncertain character, and
+   "[possibly: ...]" for an uncertain interpretation.
+8. Record crossed-out text, insertions, arrows, and boundary lines when visible.
+9. Do not silently redraw, rotate, normalize, expand abbreviations, or correct
+   the map. Do not invent labels, measurements, orientation, or relationships.
+10. If a spatial relationship is unclear, say "[relationship uncertain]" rather
+   than guessing.
+11. Transcribe each visible item only once and stop at the last visible item.
+
+Return ONLY the transcription and map description. Do not include Markdown,
+commentary, or a summary outside the marked map section."""
+        elif layout_mode in {"table", "mixed"} or table_mode:
             prompt = f"""Transcribe this handwritten document with layout mode: {layout_mode}.
 {"A bounded table occupies most of the page." if layout_mode == "table" else "The page contains a bounded table plus non-table text."}
 
@@ -410,13 +510,44 @@ def transcribe_image(
     model: str,
     max_image_size: Tuple[int, int],
 ) -> Tuple[str, Dict[str, Any]]:
-    """Transcribe a page once or in horizontal regions when it is dense."""
+    """Transcribe a page using ordered map/prose regions when available."""
     layout = classify_document_layout(
         image_path, client, tracker, model, max_image_size
     )
     table_mode = bool(layout.get("has_table"))
+    map_mode = bool(layout.get("has_map"))
+    layout["authoritative_source"] = image_path
     with Image.open(image_path) as image:
         width, height = image.size
+        detected_regions = layout.get("regions", [])
+        can_use_layout_regions = (
+            map_mode
+            and isinstance(detected_regions, list)
+            and any(region["type"] == "map" for region in detected_regions)
+            and (
+                layout.get("layout_type") != "mixed_map"
+                or any(region["type"] == "prose" for region in detected_regions)
+            )
+        )
+        if can_use_layout_regions:
+            try:
+                return _transcribe_layout_regions(
+                    image,
+                    image_path,
+                    detected_regions,
+                    client,
+                    tracker,
+                    detector,
+                    model,
+                    max_image_size,
+                    table_mode,
+                    layout,
+                )
+            except (OSError, ValueError) as exc:
+                layout["region_error"] = str(exc)
+
+        # Preserve the original whole-page path if layout analysis did not
+        # return a usable map region. This is explicitly flagged for review.
         region_count = max(1, math.ceil(height / REGION_MAX_HEIGHT))
         if region_count == 1:
             text, analysis = extract_text_with_ai_vision(
@@ -430,7 +561,22 @@ def transcribe_image(
                 layout.get("layout_type", "paragraph"),
             )
             analysis["layout"] = layout
-            if table_mode:
+            if map_mode:
+                analysis["needs_review"] = True
+                analysis["review_reasons"] = list(
+                    dict.fromkeys(
+                        [
+                            "Map region detection failed; the complete original image was transcribed as a fallback. Verify ordering and map boundaries.",
+                            *(
+                                [f"Region transcription failed: {layout['region_error']}"]
+                                if layout.get("region_error")
+                                else []
+                            ),
+                            *analysis.get("review_reasons", []),
+                        ]
+                    )
+                )
+            elif table_mode:
                 analysis["needs_review"] = True
                 analysis["review_reasons"] = list(
                     dict.fromkeys(
@@ -502,6 +648,84 @@ def transcribe_image(
             "regions": region_count,
             "layout": layout,
         }
+
+
+def _transcribe_layout_regions(
+    image: Image.Image,
+    image_path: str,
+    regions: List[Dict[str, Any]],
+    client: OpenAI,
+    tracker: TokenTracker,
+    detector: HallucinationDetector,
+    model: str,
+    max_image_size: Tuple[int, int],
+    table_mode: bool,
+    layout: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Crop validated layout regions, transcribe them, and combine page order."""
+    texts: List[str] = []
+    review_reasons: List[str] = []
+    for region in regions:
+        left = max(0, round(region["x"] * image.width) - REGION_OVERLAP)
+        top = max(0, round(region["y"] * image.height) - REGION_OVERLAP)
+        right = min(
+            image.width,
+            round((region["x"] + region["width"]) * image.width) + REGION_OVERLAP,
+        )
+        bottom = min(
+            image.height,
+            round((region["y"] + region["height"]) * image.height) + REGION_OVERLAP,
+        )
+        if right <= left or bottom <= top:
+            continue
+
+        with tempfile.NamedTemporaryFile(
+            suffix=Path(image_path).suffix, delete=False
+        ) as region_file:
+            region_path = region_file.name
+        try:
+            image.crop((left, top, right, bottom)).save(region_path)
+            region_text, region_analysis = extract_text_with_ai_vision(
+                region_path,
+                client,
+                tracker,
+                detector,
+                model,
+                max_image_size,
+                table_mode=table_mode and region["type"] == "prose",
+                layout_mode="map" if region["type"] == "map" else "paragraph",
+            )
+            texts.append(region_text)
+            review_reasons.extend(region_analysis.get("review_reasons", []))
+        finally:
+            if os.path.exists(region_path):
+                os.remove(region_path)
+
+    if not texts:
+        raise ValueError("No usable layout regions remained after cropping.")
+
+    combined_text = "\n\n".join(text.strip() for text in texts if text.strip())
+    repetition_findings = detector.detect_repetition(combined_text)
+    return combined_text, {
+        "needs_review": True,
+        "review_reasons": list(
+            dict.fromkeys(
+                [
+                    "Map and prose were transcribed from detected regions in physical page order; verify crop boundaries and overlap against the complete original image.",
+                    *review_reasons,
+                    *repetition_findings,
+                ]
+            )
+        ),
+        "repetition_findings": repetition_findings,
+        "quality_metrics": {"dpi": 0.0},
+        "text_length": len(combined_text),
+        "regions": len(texts),
+        "layout_regions": regions,
+        "layout": layout,
+    }
+
+
 def verify_transcription_with_ai_vision(
     image_path: str,
     transcribed_text: str,
@@ -515,10 +739,19 @@ def verify_transcription_with_ai_vision(
     try:
         optimized_path = optimize_image_for_api(image_path, max_image_size)
         base64_image = encode_image_to_base64(optimized_path)
+        map_instructions = ""
+        if "[HAND-DRAWN MAP]" in transcribed_text:
+            map_instructions = """
+This draft contains a hand-drawn map section. Also check that map labels,
+measurements, orientation marks, boundary relationships, and uncertainty
+markers are supported by the image. Do not treat a prose description as a
+replacement for the original drawing.
+"""
         prompt = f"""Review the image against the draft transcription below.
 Flag possible omissions, additions, repeated passages, or ordering problems.
 Pay special attention to names, dates, numbers, abbreviations, marginal notes,
-headings, and multiple columns or sections.
+headings, multiple columns or sections.
+{map_instructions}
 
 Do not rewrite, correct, modernize, or silently change the draft. Do not say
 what the historical text "should" say. Report only a possible reading or
